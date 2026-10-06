@@ -299,6 +299,16 @@ falta `WHATSAPP_APP_SECRET`.
 
 ### R16 — Iniciar la videollamada desde el hilo (botón de cámara)
 
+> **CA16.2 se ha redactado tres veces el 2026-10-06, probando el producto.** Conviene leer la
+> secuencia, porque el estado final no es un capricho: (1) habilitado solo con el paciente en
+> línea; (2) habilitado siempre, al retirar el antiguo «Unirse a videoconsulta» de la cabecera del
+> detalle —aquel botón no gateaba por presencia, iniciaba las citas agendadas y permitía reentrar,
+> así que con un solo botón el candado dejaba esos casos sin cubrir—; (3) de vuelta al candado por
+> presencia **con una excepción explícita para las citas agendadas**, que es lo que resuelve la
+> tensión entre (1) y (2). Las tres decisiones son del cliente, viendo la pantalla. Lo que se
+> aprendió: la presencia sí debe bloquear —llamar a quien no está delante abre una sala vacía—,
+> pero una cita agendada es el caso en que el paciente *no puede* estar conectado todavía.
+>
 > **CA16.6 a CA16.8 se reescribieron el 2026-10-06, después de la primera implementación.** La
 > primera versión mandaba en el cuerpo del mensaje un enlace con token (`/entrar-videoconsulta?c=…&t=…`).
 > Al probarlo, el cliente vio en pantalla el JWT completo —válido 24 h— porque la interfaz, al no
@@ -321,9 +331,24 @@ videoconsulta. El paciente se entera por un mensaje de sistema en el propio hilo
   el componente no lo pinta si el llamante es paciente, no se oculta por CSS). Hoy el hilo del
   médico se monta únicamente en `/panel-medico/consulta/[id]`; si en el futuro se monta en el
   buzón, el botón viaja con él.
-- CA16.2 **Habilitado solo con el paciente en línea.** Deshabilitado en cualquier otro caso, con un
-  texto que diga por qué («El paciente no está conectado»). La señal es la presencia del paciente
-  que ya recibe el hilo; no se introduce una tercera fuente de presencia.
+- CA16.2 **Deshabilitado si el paciente no está conectado, salvo en una cita agendada.** (Tercera
+  redacción, 2026-10-06; ver la nota de abajo.) Llamar a quien no está delante abre una sala vacía,
+  así que el botón exige presencia — **excepto** cuando la consulta está en `scheduled`: ahí
+  iniciar la cita es precisamente lo que dispara el correo que avisa al paciente, y exigir que ya
+  esté conectado dejaría las citas sin forma de empezar. El indicador de presencia sigue al lado
+  del botón diciendo el estado.
+- CA16.2c **Deshabilitado también con el caso finalizado y con la ventana de mensajes cerrada**, y
+  lo mismo vale para **el botón de entrada del paciente** en el aviso del hilo: si el médico no
+  puede llamar en un caso cerrado, el paciente no debe poder entrar a la sala desde un aviso
+  anterior. En los dos lados el motivo se dice con palabras, no solo con el color.
+- CA16.2b **Es el único botón de videoconsulta del detalle de la consulta.** El antiguo «Unirse a
+  videoconsulta» de la cabecera desaparece: hacía lo mismo y obligaba a mantener dos caminos a la
+  sala. Por eso este botón absorbe lo que aquel hacía y el chat no cubría:
+  - **Inicia una cita agendada.** Si la consulta está en `scheduled`, la transición a
+    `in_progress` ocurre antes de abrir la sala, con el correo «tu médico ya está en la sala» que
+    ese flujo ya enviaba. Sin esto, una cita agendada se quedaría sin forma de iniciarse.
+  - **Permite volver a entrar** a una sala ya abierta sin que el hilo acumule un aviso por cada
+    reentrada. El aviso tiene sentido la primera vez; a la décima es ruido en el historial clínico.
 - CA16.3 `POST /consultations/{id}/video-call`, permiso `messages.write` **y** ser el médico
   tratante actual o previo en la cadena. Un médico ajeno recibe 404 (no 403, criterio de CA2.1);
   un paciente —con sesión o con `X-Consultation-Token`— recibe **404**, nunca puede iniciar la

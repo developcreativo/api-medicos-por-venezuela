@@ -35,6 +35,7 @@ _IS_PROD = settings.ENVIRONMENT == "production"
 _INSECURE_JWT_DEFAULT = "dev-insecure-jwt-secret-change-me"
 _INSECURE_SERVICE_ROLE_DEFAULT = "dev-insecure-service-role-key-change-me"
 _INSECURE_CONSULTATION_TOKEN_DEFAULT = "dev-insecure-consultation-token-secret-change-me"
+_INSECURE_EMAIL_VERIFICATION_DEFAULT = "dev-insecure-email-verification-secret-change-me"
 _INSECURE_CLINICAL_KEY_DEFAULT = "ZGV2LWluc2VjdXJlLWNsaW5pY2FsLWtleS0zMmJ5dGU="
 _INSECURE_CLINICAL_KID = clinical_crypto.key_id(base64.b64decode(_INSECURE_CLINICAL_KEY_DEFAULT))
 
@@ -51,6 +52,17 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         raise RuntimeError(
             "SUPABASE_SERVICE_ROLE_KEY tiene el valor por defecto inseguro. "
             "Configúralo en producción (Supabase → Settings → API → service_role key)."
+        )
+    if _IS_PROD and settings.EMAIL_VERIFICATION_DEBUG_CODE:
+        raise RuntimeError(
+            "EMAIL_VERIFICATION_DEBUG_CODE no puede estar activo en producción: "
+            "expondría el código de verificación en la respuesta del endpoint de envío."
+        )
+    if _IS_PROD and settings.EMAIL_VERIFICATION_SECRET == _INSECURE_EMAIL_VERIFICATION_DEFAULT:
+        raise RuntimeError(
+            "EMAIL_VERIFICATION_SECRET tiene el valor por defecto inseguro. Configúralo en "
+            "producción (32 bytes aleatorios, propio, no reutilices CONSULTATION_TOKEN_SECRET): "
+            "con él se firman los tokens de verificación de correo."
         )
     # Deja los orígenes CORS efectivos en los logs de arranque: cuando un front rebota por CORS,
     # se ve de una si su origen está (o no) en la lista, sin adivinar desde el .env.

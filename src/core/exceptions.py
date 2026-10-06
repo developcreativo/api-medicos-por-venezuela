@@ -16,6 +16,8 @@ from src.core.errors import (
     ConflictError,
     ForbiddenError,
     NotFoundError,
+    ServiceUnavailableError,
+    TooManyRequestsError,
     UnprocessableError,
     UpstreamServiceError,
 )
@@ -72,6 +74,21 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(ForbiddenError)
     async def _forbidden(request: Request, exc: ForbiddenError) -> JSONResponse:
         return _json(status.HTTP_403_FORBIDDEN, str(exc) or "Acción no permitida.")
+
+    @app.exception_handler(TooManyRequestsError)
+    async def _too_many_requests(request: Request, exc: TooManyRequestsError) -> JSONResponse:
+        return _json(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            str(exc) or "Demasiadas peticiones. Inténtalo de nuevo más tarde.",
+        )
+
+    @app.exception_handler(ServiceUnavailableError)
+    async def _service_unavailable(request: Request, exc: ServiceUnavailableError) -> JSONResponse:
+        logger.error("ServiceUnavailableError en %s: %s", request.url.path, type(exc).__name__)
+        return _json(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Servicio no disponible temporalmente. Inténtalo de nuevo más tarde.",
+        )
 
     @app.exception_handler(UpstreamServiceError)
     async def _upstream(request: Request, exc: UpstreamServiceError) -> JSONResponse:

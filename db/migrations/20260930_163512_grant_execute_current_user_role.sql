@@ -1,0 +1,14 @@
+-- Migración: grant_execute_current_user_role
+-- Creada:    2026-09-30 16:35:12
+--
+-- Debe ser idempotente (IF NOT EXISTS / ON CONFLICT). El runner la envuelve en
+-- una transacción; no uses CREATE INDEX CONCURRENTLY (no corre en transacción).
+--
+-- BUG QUE CORRIGE: `20260914_111456` hizo `create or replace function
+-- public.current_user_role()` y PostgreSQL RESETEA el ACL al reemplazar una función: el
+-- EXECUTE quedó solo para el dueño (postgres). Las policies que la llaman corren como el
+-- caller (`authenticated`), así que quedaban rotas en cuanto la tabla tuviera privilegios
+-- (hoy `consultations` los tiene revocados, por eso el fallo estaba latente). La función es
+-- `security definer` y devuelve SOLO el rol del propio `auth.uid()`: exponerla no filtra
+-- nada de terceros.
+grant execute on function public.current_user_role() to anon, authenticated;

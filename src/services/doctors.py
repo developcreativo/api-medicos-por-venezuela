@@ -757,9 +757,9 @@ async def create_doctor(session: AsyncSession, data: DoctorCreate) -> Registrati
     user_id = (
         await session.execute(select(Profile.id).where(Profile.email == data.email))
     ).scalar_one_or_none()
-    doctor = Doctor(
-        **data.model_dump(exclude={"website"}), verified=check.verified, user_id=user_id
-    )
+    # email_verification_token es solo para verificación previa; no se guarda en la BD.
+    doctor_data = data.model_dump(exclude={"website", "email_verification_token"})
+    doctor = Doctor(**doctor_data, verified=check.verified, user_id=user_id)
     _apply_official_identity(doctor, check)
     session.add(doctor)
     await session.flush()

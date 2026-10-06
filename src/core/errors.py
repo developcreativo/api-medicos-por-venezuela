@@ -32,3 +32,13 @@ class ForbiddenError(Exception):
 class UpstreamServiceError(Exception):
     """Un servicio externo (p. ej. Supabase Admin API) falló o es inalcanzable.
     -> HTTP 502. Nunca debe llevar el cuerpo de la respuesta upstream ni secretos."""
+
+
+class TooManyRequestsError(Exception):
+    """Demasiadas peticiones (rate limit o cooldown de negocio). -> HTTP 429.
+    El mensaje está pensado para el usuario final, sin filtrar detalles internos."""
+
+
+class ServiceUnavailableError(Exception):
+    """El servicio no está disponible temporalmente (p. ej. Mailtrap sin token o caído).
+    -> HTTP 503. El mensaje es genérico para el cliente."""

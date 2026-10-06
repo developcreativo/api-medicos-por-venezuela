@@ -351,7 +351,12 @@ async def mark_messages_read(
     status_code=status.HTTP_201_CREATED,
     summary="Iniciar la videollamada desde el hilo (solo el médico tratante)",
     responses={
-        201: {"description": "Sala asegurada y mensaje de sistema creado en el hilo."},
+        201: {
+            "description": (
+                "Sala asegurada y aviso en el hilo. En una reentrada dentro de la ventana, "
+                "`message_id` es el del aviso que ya estaba."
+            )
+        },
         401: {"description": "No autenticado (sin sesión ni token de consulta)."},
         403: {"description": "Permiso messages.write requerido para staff."},
         404: {
@@ -360,12 +365,19 @@ async def mark_messages_read(
                 "admin no tratante y paciente (con sesión o con token) reciben 404, nunca 403."
             )
         },
-        409: {"description": "La consulta no admite mensajes o ya no está abierta."},
+        409: {
+            "description": (
+                "La consulta no admite mensajes (estado fuera de la lista blanca), ya no está "
+                "abierta, está asignada a otro médico, o la cita agendada la abrió otra "
+                "petición simultánea."
+            )
+        },
     },
 )
 async def start_video_call(
     consultation_id: uuid.UUID,
     request: Request,
+    background_tasks: BackgroundTasks,
     x_consultation_token: str | None = Header(default=None, alias=_CONSULTATION_TOKEN_HEADER),
     principal: Principal | None = Depends(get_optional_principal),
     db: AsyncSession = Depends(get_db),
@@ -374,7 +386,20 @@ async def start_video_call(
 
     Asegura la sala de la consulta (idempotente: dos clics devuelven la misma URL) y crea en el
     hilo un **mensaje de sistema** (`sender_role=system`, `direction=system`, `kind=call`) con el
-    texto del aviso. El paciente lo ve en el hilo sin recargar; no se le manda correo.
+    texto del aviso. El paciente lo ve en el hilo sin recargar.
+
+    Es el **único** botón de videoconsulta del detalle (CA16.2b), así que absorbe lo que hacía el
+    antiguo «Unirse a videoconsulta»:
+
+    - **Cita agendada:** si la consulta está en `scheduled`, la pasa a `in_progress` y le crea la
+      sala antes de responder, con el correo "tu médico ya está en la sala" que ese flujo ya
+      enviaba. El doble clic da 409, no abre la cita dos veces.
+    - **Reentrada:** volver a entrar dentro de `MESSAGING_CALL_NOTICE_WINDOW_MINUTES` **no**
+      añade otro aviso al hilo; se devuelve el `message_id` del que ya está. La sala se asegura y
+      el `audit_log` se escribe en cada intento.
+
+    La presencia del paciente **no** condiciona nada (CA16.2): si no está conectado, la llamada se
+    inicia igual y el aviso lo espera en el hilo.
 
     El cuerpo del mensaje **no lleva ninguna URL ni ningún token** (CA16.6): quien lo lee ya está
     autenticado para estar en el hilo, así que la interfaz arma el acceso con el `consultation_id`
@@ -400,12 +425,16 @@ async def start_video_call(
             detail="No tienes permiso para esta acción.",
         )
 
-    room_url, message_id = await messaging.start_video_call(
+    room_url, message_id, video_mail_args = await messaging.start_video_call(
         db,
         consultation_id=consultation_id,
         principal=principal,
         client_ip=client_ip(request),
     )
+    # Solo cuando esta llamada abrió una cita agendada: es el correo que ya mandaba
+    # `POST /consultations/{id}/start`, encolado igual que allí (CA16.2b).
+    if video_mail_args:
+        background_tasks.add_task(notifications.send_video_ready_email, **video_mail_args)
     return VideoCallStartResponse(room_url=room_url, message_id=message_id)
 
 

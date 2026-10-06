@@ -2008,6 +2008,19 @@ async def _system_call_messages(db: AsyncSession, cid: str) -> list[Message]:
     return list(rows.scalars().all())
 
 
+async def _call_started_entries(db: AsyncSession, cid: str) -> list[AuditLog]:
+    """Trazas `call.started` de la consulta.
+
+    Sin `order_by` por `created_at`: en los tests todo corre dentro de UNA transacción
+    (savepoints), y el `now()` de Postgres es el de la transacción, así que las dos filas
+    comparten marca de tiempo y el orden sería indefinido. Se comparan como conjunto.
+    """
+    rows = await db.execute(
+        select(AuditLog).where(AuditLog.action == "call.started", AuditLog.resource_id == cid)
+    )
+    return list(rows.scalars().all())
+
+
 async def test_el_medico_tratante_inicia_la_llamada_y_deja_un_mensaje_de_sistema(
     client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
 ) -> None:
@@ -2047,18 +2060,7 @@ async def test_el_medico_tratante_inicia_la_llamada_y_deja_un_mensaje_de_sistema
     assert crudo.startswith("enc:v1:")
 
     # Auditoría: `call.started`, sin contenido y sin la URL de la sala.
-    entradas = list(
-        (
-            await db_session.execute(
-                select(AuditLog).where(
-                    AuditLog.action == "call.started",
-                    AuditLog.resource_id == cid,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    entradas = await _call_started_entries(db_session, cid)
     assert len(entradas) == 1
     traza = entradas[0]
     assert traza.actor_user_id == doc.id
@@ -2067,11 +2069,19 @@ async def test_el_medico_tratante_inicia_la_llamada_y_deja_un_mensaje_de_sistema
     assert "body" not in (traza.metadata_ or {})
 
 
-async def test_dos_llamadas_reutilizan_la_misma_sala(
+async def test_la_reentrada_reutiliza_sala_y_aviso_pero_deja_su_propia_traza(
     client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """CA16.4: `ensure_video_room` es idempotente — dos clics no dejan a médico y paciente en
-    salas distintas. El aviso en el hilo sí se repite (cada intento deja constancia)."""
+    """CA16.2b/CA16.4: volver a entrar no duplica nada visible para el paciente.
+
+    `ensure_video_room` es idempotente (dos clics no dejan a médico y paciente en salas
+    distintas) y el aviso del hilo se **reutiliza** dentro de la ventana: el médico entra y sale
+    de la sala varias veces en una misma atención, y un aviso por intento dejaría cinco líneas
+    idénticas en el historial clínico.
+
+    Lo que sí se repite es el `audit_log`: cada intento de llamada es una traza legítima
+    (CA16.9). El hilo cuenta la conversación; el audit cuenta los intentos.
+    """
     doc = await add_doctor(db_session)
     cid, _, _ = await _create_test_case(client, db_session, doctor=doc)
 
@@ -2083,14 +2093,52 @@ async def test_dos_llamadas_reutilizan_la_misma_sala(
     )
     assert primera.status_code == 201 and segunda.status_code == 201
     assert primera.json()["room_url"] == segunda.json()["room_url"]
-    assert primera.json()["message_id"] != segunda.json()["message_id"]
+    # Mismo aviso: el contrato no cambia, se devuelve el `message_id` del que ya estaba.
+    assert primera.json()["message_id"] == segunda.json()["message_id"]
 
     mensajes = await _system_call_messages(db_session, cid)
-    assert len(mensajes) == 2
+    assert len(mensajes) == 1
     # Y una sola sala en la consulta.
     consulta = await db_session.get(Consultation, uuid.UUID(cid))
     assert consulta is not None
     assert consulta.video_room_url == primera.json()["room_url"]
+
+    # Dos intentos, dos trazas. La segunda dice que el aviso se reutilizó.
+    trazas = await _call_started_entries(db_session, cid)
+    assert len(trazas) == 2
+    assert sorted(t.metadata_["notice_reused"] for t in trazas) == [False, True]
+
+
+async def test_pasada_la_ventana_la_llamada_deja_un_aviso_nuevo(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Fuera de `MESSAGING_CALL_NOTICE_WINDOW_MINUTES` ya no es una reentrada: es una llamada
+    nueva y el paciente necesita saberlo, así que lleva su propio aviso con su propia hora.
+
+    Se envejece el aviso anterior en lugar de esperar media hora: la ventana es la de `Settings`.
+    """
+    doc = await add_doctor(db_session)
+    cid, _, _ = await _create_test_case(client, db_session, doctor=doc)
+
+    primera = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert primera.status_code == 201
+
+    viejo = (await _system_call_messages(db_session, cid))[0]
+    viejo.sent_at = datetime.now(UTC) - timedelta(
+        minutes=settings.MESSAGING_CALL_NOTICE_WINDOW_MINUTES + 1
+    )
+    await db_session.flush()
+
+    segunda = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert segunda.status_code == 201
+    assert segunda.json()["message_id"] != primera.json()["message_id"]
+    assert len(await _system_call_messages(db_session, cid)) == 2
+    # La sala sigue siendo la misma: lo que caducó es el aviso, no la consulta.
+    assert segunda.json()["room_url"] == primera.json()["room_url"]
 
 
 async def test_la_sala_que_ya_existia_no_se_regenera(
@@ -2330,9 +2378,9 @@ async def test_iniciar_la_llamada_no_le_escribe_al_paciente(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """El paciente se entera por el mensaje del hilo, no por correo: el botón solo se habilita
-    con el paciente en línea, así que `video_ready_email` sería redundante y gastaría el rate
-    limit de correo."""
+    """Sobre un caso ya `in_progress` el paciente se entera por el mensaje del hilo y nada más:
+    no se gasta el rate limit de correo en repetir lo que el hilo ya dice. El único correo que
+    esta ruta manda es el de la cita agendada, y porque ese flujo ya lo mandaba (CA16.2b)."""
     doc = await add_doctor(db_session)
     cid, pid, _ = await _create_test_case(client, db_session, doctor=doc)
     patient = await db_session.get(Patient, uuid.UUID(pid))
@@ -2582,3 +2630,151 @@ async def test_la_lectura_concedida_queda_auditada_una_vez_por_pagina(
     # El admin, sin grant, no deja entrada de lectura concedida
     await client.get(f"{PREFIX}/consultations/{cid}/messages")
     assert await _lecturas_clinicas(db_session, admin_identity.id, cid) == 0
+
+
+async def test_la_llamada_inicia_la_cita_agendada_y_manda_su_correo(
+    client: AsyncClient,
+    anon_client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CA16.2b: una cita agendada se abre desde aquí, con el correo que ese flujo ya mandaba.
+
+    Al retirarse el botón «Unirse a videoconsulta» del detalle, este endpoint es el único camino
+    a la sala: si no hiciera la transición, una cita de la Agenda se quedaría sin forma de
+    empezar (`scheduled` no está entre los estados de `ensure_video_room`, así que daría 409).
+
+    Se reutiliza `start_scheduled_consultation` tal cual —su UPDATE condicional y su evento
+    `opened`— y el correo se encola en el router con `BackgroundTasks`, igual que en
+    `POST /consultations/{id}/start`.
+    """
+    doc = await add_doctor(db_session)
+    cid, pid, _ = await _create_test_case(client, db_session, doctor=doc, status="scheduled")
+    patient = await db_session.get(Patient, uuid.UUID(pid))
+    assert patient is not None
+    patient.email = "agenda@example.com"
+    await db_session.flush()
+
+    avisos: list[dict] = []
+
+    async def _fake_video_ready(**kwargs) -> bool:
+        avisos.append(kwargs)
+        return True
+
+    monkeypatch.setattr(notifications, "send_video_ready_email", _fake_video_ready)
+
+    resp = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert resp.status_code == 201, resp.text
+
+    consulta = await db_session.get(Consultation, uuid.UUID(cid))
+    assert consulta is not None
+    await db_session.refresh(consulta)
+    assert consulta.status == "in_progress"
+    assert consulta.opened_at is not None
+    assert consulta.video_room_url == resp.json()["room_url"]
+
+    # El evento del claim de la Agenda, que es lo que hace de este médico el tratante.
+    eventos = (
+        (
+            await db_session.execute(
+                select(ConsultationEvent).where(
+                    ConsultationEvent.consultation_id == consulta.id,
+                    ConsultationEvent.event_type == "opened",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(eventos) == 1
+
+    # El correo "tu médico ya está en la sala", con su enlace tokenizado: ahí SÍ hace falta,
+    # porque el destinatario no está autenticado (CA16.6 solo prohíbe el enlace en el cuerpo
+    # del mensaje del hilo).
+    assert len(avisos) == 1
+    assert avisos[0]["to_email"] == "agenda@example.com"
+    assert "/entrar-videoconsulta?c=" in avisos[0]["join_url"]
+    assert settings.JITSI_DOMAIN not in avisos[0]["join_url"]
+
+    # Y el aviso en el hilo, uno solo.
+    assert len(await _system_call_messages(db_session, cid)) == 1
+
+
+async def test_sobre_la_cita_ya_abierta_no_se_repite_ni_el_correo_ni_el_evento(
+    client: AsyncClient,
+    anon_client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reentrar a una cita que esta misma ruta ya abrió no vuelve a abrirla.
+
+    La transición solo ocurre si la consulta sigue en `scheduled`, así que el segundo clic no
+    manda otro correo ni escribe otro evento `opened` — y tampoco falla con 409, que sería
+    absurdo para quien solo quiere volver a entrar a su sala.
+    """
+    doc = await add_doctor(db_session)
+    cid, pid, _ = await _create_test_case(client, db_session, doctor=doc, status="scheduled")
+    patient = await db_session.get(Patient, uuid.UUID(pid))
+    assert patient is not None
+    patient.email = "agenda@example.com"
+    await db_session.flush()
+
+    avisos: list[dict] = []
+
+    async def _fake_video_ready(**kwargs) -> bool:
+        avisos.append(kwargs)
+        return True
+
+    monkeypatch.setattr(notifications, "send_video_ready_email", _fake_video_ready)
+
+    primera = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    segunda = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert primera.status_code == 201, primera.text
+    assert segunda.status_code == 201, segunda.text
+    assert primera.json()["room_url"] == segunda.json()["room_url"]
+    assert primera.json()["message_id"] == segunda.json()["message_id"]
+
+    assert len(avisos) == 1, "el correo de la cita agendada sale una sola vez"
+    eventos = await db_session.scalar(
+        select(func.count(ConsultationEvent.id)).where(
+            ConsultationEvent.consultation_id == uuid.UUID(cid),
+            ConsultationEvent.event_type == "opened",
+        )
+    )
+    assert eventos == 1
+    assert len(await _system_call_messages(db_session, cid)) == 1
+    # Los dos intentos sí quedan en el audit.
+    assert len(await _call_started_entries(db_session, cid)) == 2
+
+
+async def test_la_presencia_del_paciente_no_condiciona_la_llamada(
+    client: AsyncClient, anon_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """CA16.2 (revisado el 2026-10-06): el backend nunca gateó por presencia y sigue sin hacerlo.
+
+    El candado era del frontend y se retiró al quedar un solo botón: con el antiguo «Unirse a
+    videoconsulta» fuera, exigir al paciente conectado dejaría sin camino a la sala justo los
+    casos que ese botón cubría (la cita agendada y la reentrada). La presencia sigue siendo
+    información para que el médico decida, no condición.
+    """
+    doc = await add_doctor(db_session)
+    cid, _, _ = await _create_test_case(client, db_session, doctor=doc)
+
+    # Nadie registró actividad del paciente: no está en línea por ninguna de las dos señales.
+    consulta = await db_session.get(Consultation, uuid.UUID(cid))
+    assert consulta is not None
+    assert consulta.patient_last_seen_at is None
+    assert messaging.is_patient_online(consulta.id, None) is False
+
+    resp = await anon_client.post(
+        f"{PREFIX}/consultations/{cid}/video-call", headers=auth_headers(doc.id)
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["room_url"]
+    assert len(await _system_call_messages(db_session, cid)) == 1

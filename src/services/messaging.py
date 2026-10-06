@@ -555,12 +555,39 @@ async def send_message(
 _CALL_STARTED_BODY = "El médico inició la videoconsulta."
 
 
+async def _recent_call_notice(session: AsyncSession, consultation_id: uuid.UUID) -> Message | None:
+    """El aviso de llamada del hilo que sigue vigente, o None si hay que crear uno nuevo.
+
+    "Vigente" = enviado dentro de `MESSAGING_CALL_NOTICE_WINDOW_MINUTES`. Es lo que convierte
+    una reentrada en una reentrada y no en un aviso más: el médico entra y sale de la sala varias
+    veces durante una misma atención (se le cae la conexión, recarga la pestaña, cierra la ventana
+    de Jitsi sin querer), y con un aviso por intento el historial clínico acaba con cinco líneas
+    idénticas que no cuentan nada. El aviso que ya está sigue siendo el vigente y el botón del
+    paciente sigue sirviendo, porque la interfaz resuelve la sala con una llamada autenticada.
+
+    Pasada la ventana es una llamada **nueva**: el paciente necesita saberlo, así que sí lleva su
+    propio aviso con su propia hora.
+    """
+    since = datetime.now(UTC) - timedelta(minutes=settings.MESSAGING_CALL_NOTICE_WINDOW_MINUTES)
+    return await session.scalar(
+        select(Message)
+        .where(
+            Message.consultation_id == consultation_id,
+            Message.direction == "system",
+            Message.kind == "call",
+            Message.sent_at >= since,
+        )
+        .order_by(Message.sent_at.desc(), Message.id.desc())
+        .limit(1)
+    )
+
+
 async def start_video_call(
     session: AsyncSession,
     consultation_id: uuid.UUID,
     principal: Principal | None,
     client_ip: str | None = None,
-) -> tuple[str, uuid.UUID]:
+) -> tuple[str, uuid.UUID, dict | None]:
     """Inicia la videollamada del hilo y deja constancia con un mensaje de sistema (R16).
 
     Asimetría dura (CA16.3): llama **solo** el médico tratante, actual o previo en la cadena
@@ -568,11 +595,17 @@ async def start_video_call(
     sesión, paciente con token de consulta, médico ajeno, admin no tratante— recibe
     `NotFoundError`, nunca un 403: un 403 confirmaría que la consulta existe.
 
-    No se dispara `video_ready_email`: el paciente se entera por el mensaje del hilo (el botón
-    solo se habilita con el paciente en línea), así el correo sería redundante y gastaría el
-    rate limit de Mailtrap.
+    **La presencia del paciente no condiciona nada aquí** (CA16.2, revisado el 2026-10-06): el
+    candado era del frontend y se retiró. Si el paciente no está conectado, la llamada se inicia
+    igual y el aviso lo espera en el hilo.
 
-    Devuelve `(room_url, message_id)`.
+    Absorbe lo que hacía el botón «Unirse a videoconsulta» del detalle, que desaparece (CA16.2b):
+    si la consulta está **agendada**, la abre antes de asegurar la sala y devuelve los argumentos
+    del correo "tu médico ya está en la sala" para que el router lo encole; y una **reentrada**
+    dentro de la ventana reutiliza el aviso que ya está en el hilo en vez de añadir otro.
+
+    Devuelve `(room_url, message_id, video_mail_args)`. `video_mail_args` es None salvo cuando
+    esta llamada abrió una cita agendada.
     """
     consultation = await session.get(Consultation, consultation_id)
     if consultation is None:
@@ -586,6 +619,33 @@ async def start_video_call(
 
     check_can_write_in_consultation(consultation, is_doctor=True)
 
+    # Cita agendada: abrirla ANTES de pedir la sala. `scheduled` no está entre los estados de
+    # `ensure_video_room`, así que sin este paso una cita de la Agenda daría 409 y se quedaría
+    # sin forma de empezar — era lo que hacía el botón que se retira (CA16.2b).
+    #
+    # Se reutiliza `start_scheduled_consultation` tal cual: su UPDATE condicional sobre
+    # `status == 'scheduled'` es lo que hace que el doble clic no duplique el evento `opened`
+    # (el segundo recibe 409), y su `_ensure_can_manage` mantiene el anti-IDOR por si quien
+    # llama es un tratante de un tramo anterior de la cadena pero no el de ESTA cita.
+    #
+    # ⚠️ PERMISO: esta transición entra por `messages.write` (lo fija CA16.3), mientras que su
+    # ruta propia `POST /consultations/{id}/start` exige `queue.take`. Hoy no amplía nada —los
+    # tres roles sembrados con `messages.write` (doctor, admin, super_admin) tienen también
+    # `queue.take`— y el objeto sigue protegido por `is_doctor_in_chain` + `_ensure_can_manage`.
+    # Pero si algún día se siembra un rol con uno y no el otro, ESTA es la línea que le deja
+    # abrir citas agendadas sin `queue.take`: o se le añade el permiso, o aquí se exige explícito.
+    video_mail_args: dict | None = None
+    if consultation.status == "scheduled":
+        consultation = await consultations_service.start_scheduled_consultation(
+            session,
+            consultation.id,
+            actor_user_id=principal.id,
+            actor_is_admin=principal.is_admin,
+        )
+        # El correo lo encola el ROUTER con BackgroundTasks, igual que `POST /{id}/start`: aquí
+        # solo se resuelven los valores planos mientras la sesión está viva.
+        video_mail_args = await notifications.video_ready_mail_args(session, consultation)
+
     # Sala idempotente: si ya existe se reutiliza (`ensure_video_room`). Dos clics no dejan a
     # médico y paciente en salas distintas. No se duplica esa lógica aquí.
     consultation = await consultations_service.ensure_video_room(session, consultation.id)
@@ -593,41 +653,55 @@ async def start_video_call(
     if not room_url:  # pragma: no cover - ensure_video_room ya falla con ConflictError
         raise ConflictError("La consulta ya no está abierta.")
 
-    # `direction='system'` no es ninguna de las dos direcciones, así que este mensaje NO cuenta
-    # como no leído para nadie (ni para el médico que lo provocó ni para el paciente): los
-    # contadores y el marcado de leído siguen mirando solo `doctor_to_patient` /
-    # `patient_to_doctor`. Decisión deliberada y simétrica (ver spec R16 en tasks/).
-    message_id = uuid.uuid4()
-    message = Message(
-        id=message_id,
-        consultation_id=consultation.id,
-        sender_role="system",
-        sender_user_id=None,
-        direction="system",
-        channel="web",
-        kind="call",
-        # `call_session_id` se queda nulo a propósito: la columna apunta a una tabla que no
-        # existe (deuda declarada) y R16 excluye el ciclo de vida de la llamada.
-        body=_CALL_STARTED_BODY,
-        sent_at=datetime.now(UTC),
-        delivery_status="sent",
-    )
-    session.add(message)
+    # Reentrada: si el aviso anterior sigue vigente se devuelve ESE `message_id` y el hilo no
+    # crece. Lo que NO depende de esto, a propósito: la sala (arriba) se asegura en cada intento
+    # porque el médico tiene que poder entrar, y el `audit_log` (abajo) se escribe en cada
+    # intento porque cada intento de llamada es una traza legítima (CA16.9).
+    notice = await _recent_call_notice(session, consultation.id)
+    if notice is not None:
+        message_id = notice.id
+    else:
+        # `direction='system'` no es ninguna de las dos direcciones, así que este mensaje NO
+        # cuenta como no leído para nadie (ni para el médico que lo provocó ni para el
+        # paciente): los contadores y el marcado de leído siguen mirando solo
+        # `doctor_to_patient` / `patient_to_doctor`. Decisión deliberada y simétrica.
+        message_id = uuid.uuid4()
+        session.add(
+            Message(
+                id=message_id,
+                consultation_id=consultation.id,
+                sender_role="system",
+                sender_user_id=None,
+                direction="system",
+                channel="web",
+                kind="call",
+                # `call_session_id` se queda nulo a propósito: la columna apunta a una tabla que
+                # no existe (deuda declarada) y R16 excluye el ciclo de vida de la llamada.
+                body=_CALL_STARTED_BODY,
+                sent_at=datetime.now(UTC),
+                delivery_status="sent",
+            )
+        )
 
-    # Sin contenido y sin la URL de la sala (CA16.7).
+    # Sin contenido y sin la URL de la sala (CA16.9). Se registra aunque el aviso se haya
+    # reutilizado: el hilo cuenta la conversación, el audit cuenta los intentos.
     await log_action(
         session,
         action="call.started",
         actor_user_id=principal.id,
         resource="consultations",
         resource_id=str(consultation.id),
-        metadata={"consultation_id": str(consultation.id), "message_id": str(message_id)},
+        metadata={
+            "consultation_id": str(consultation.id),
+            "message_id": str(message_id),
+            "notice_reused": notice is not None,
+        },
         ip=client_ip,
         correlation_id=correlation_id_ctx.get(),
     )
     await session.commit()
 
-    return room_url, message_id
+    return room_url, message_id, video_mail_args
 
 
 async def list_messages(

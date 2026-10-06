@@ -29,6 +29,9 @@ class DoctorCreate(BaseModel):
     phone: str = Field(..., pattern=_PHONE_PATTERN)
     email: EmailStr
     country_of_residence: str | None = Field(default=None, max_length=100)
+    # Token de verificación de correo (emitido por POST /email-verification/verify).
+    # Obligatorio cuando EMAIL_VERIFICATION_REQUIRED=true y el payload trae email.
+    email_verification_token: str | None = None
     # Honeypot anti-bot: debe llegar vacío. El frontend lo renderiza oculto; un
     # humano no lo llena. Si viene con valor, el backend rechaza la solicitud.
     website: str | None = Field(default=None, max_length=200)

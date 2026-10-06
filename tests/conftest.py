@@ -15,6 +15,7 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
 from src.core.ratelimit import limiter
 from src.db.session import engine, get_db
 from src.main import app
@@ -24,6 +25,9 @@ from tests._helpers import auth_headers
 # El rate limiting se desactiva en las pruebas: varias hacen múltiples requests al
 # mismo endpoint y dispararían el 429.
 limiter.enabled = False
+# Gate de verificación de correo: apagado en tests (los tests que lo prueban lo
+# reactivan con monkeypatch).
+settings.EMAIL_VERIFICATION_REQUIRED = False
 
 
 @pytest_asyncio.fixture
