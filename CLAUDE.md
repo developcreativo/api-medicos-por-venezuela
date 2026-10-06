@@ -14,6 +14,9 @@ Para mantener la consistencia, debes guiarte estrictamente por los submódulos d
 - **Ecosistema y Calidad:** Ver `@.claude/rules/commands.md` (Uso de `uv`, `Ruff` y `Pytest`).
 - **Persistencia y Concurrencia:** Ver `@.claude/rules/db_env.md` (Bloqueos rápidos `nowait` y SQLAlchemy 2.0).
 - **Habilidades y Errores Globales:** Ver `@.claude/rules/fastapi_skills.md` (Manejadores, Pydantic v2 y Async).
+- **Mensajería (buzón, correo, WhatsApp):** Ver `@.claude/rules/mensajeria.md` (hilo por consulta, consentimiento, webhook de Meta, nada del cuerpo fuera de la plataforma).
+
+**Skills de trabajo** en `.claude/skills/`: `nueva-funcionalidad` (spec → plan → todo → código), `corregir-bug` (reproducir → test → fix), `mensajeria` (contexto del módulo). Contexto del cliente y acuerdos: `.knowledge/mensajeria.md`. Correcciones pendientes de autorizar: `tasks/backlog-correcciones.md`.
 
 ## ⚠️ Restricciones Críticas de Producción
 1. **Doble Selección Prohibida:** Si un médico intenta seleccionar un paciente ya tomado, el sistema no debe quedarse colgado; debe fallar rápido y retornar un `HTTP 409 Conflict`.

@@ -14,6 +14,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +26,7 @@ from src.models.patient import Patient
 from src.models.profile import Profile
 from src.models.specialty import Specialty
 from src.schemas.consultation import WaitingRoomResponse
+from src.services import messaging
 
 logger = logging.getLogger("mpv.api")
 
@@ -127,23 +129,26 @@ async def sse_events(
     max_seconds: float,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    fetch_latest_message: (
+        Callable[[], Awaitable[tuple[uuid.UUID, str, datetime, int] | None]] | None
+    ) = None,
 ) -> AsyncIterator[str]:
-    """Stream SSE del estado de la sala: un evento `status` al conectar y en cada cambio.
+    """Stream SSE del estado de la sala: evento `status` y evento `message` (R8.1).
 
-    - Latido (`: ping`) si pasa `heartbeat_seconds` sin eventos, para que ningún proxy corte la
-      conexión por inactividad.
-    - Termina cuando el caso se da por terminado o a los `max_seconds`: el cliente reconecta. Un
-      stream nunca vive indefinidamente.
-    - Si el caso desaparece, emite `gone` y termina; un fallo de base se registra y termina (el
-      cliente cae a pedir el JSON).
-
-    `fetch` abre y cierra su propia sesión por ciclo: el stream no retiene una conexión del pool
-    mientras el paciente espera."""
+    - Latido (`: ping`) si pasa `heartbeat_seconds` sin eventos.
+    - Presencia: registra la presencia del paciente en cada ciclo (solo visible por el médico).
+    - Asimetría: NUNCA emite información de presencia del médico al paciente.
+    - Emite `message` { message_id, direction, sent_at, unread_count } cuando hay un
+      mensaje nuevo hacia el paciente.
+    - Termina cuando el caso se da por terminado o a los `max_seconds`: el cliente reconecta.
+    """
     started = clock()
     last_state: WaitingRoomResponse | None = None
+    last_seen_msg_id: uuid.UUID | None = None
     last_emit = started
     yield "retry: 5000\n\n"
     while True:
+        messaging.record_patient_presence(requested_id)
         try:
             state = await fetch()
         except NotFoundError:
@@ -161,7 +166,31 @@ async def sse_events(
             last_emit = now
             if state.phase == PHASE_FINISHED:
                 return
-        elif now - last_emit >= heartbeat_seconds:
+
+        # R8.1 — Evento message cuando hay uno nuevo hacia el paciente (sin cuerpo)
+        if fetch_latest_message is not None:
+            try:
+                msg_info = await fetch_latest_message()
+                if msg_info is not None:
+                    msg_id, direction, sent_at, unread_count = msg_info
+                    if msg_id != last_seen_msg_id:
+                        yield _event(
+                            "message",
+                            {
+                                "message_id": str(msg_id),
+                                "direction": direction,
+                                "sent_at": sent_at.isoformat(),
+                                "unread_count": unread_count,
+                            },
+                        )
+                        last_seen_msg_id = msg_id
+                        last_emit = now
+            except Exception:
+                logger.warning(
+                    "SSE:waiting_room_msg_error consultation_id=%s", requested_id, exc_info=True
+                )
+
+        if now - last_emit >= heartbeat_seconds:
             yield ": ping\n\n"
             last_emit = now
         if now - started >= max_seconds:

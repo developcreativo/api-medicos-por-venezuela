@@ -70,13 +70,18 @@ class Settings(BaseSettings):
     # Si no se define, solo se valida HS256 con SUPABASE_JWT_SECRET (comportamiento de siempre).
     SUPABASE_JWKS_URL: str | None = None
 
-    # --- Supabase Admin API (creación de usuarios de Auth) ---
+    # --- Supabase Admin API (usuarios de Auth) y Storage (adjuntos del chat) ---
     # Base URL del proyecto Supabase (local: el gateway del CLI; prod: el proyecto real).
-    # El service-role key da acceso admin total (bypassa RLS): NUNCA se loguea y solo lo
-    # usa `src/services/users.py`. En producción es OBLIGATORIO definirlo por entorno; el
-    # valor por defecto es solo para desarrollo/pruebas locales.
+    # El service-role key da acceso admin total (bypassa RLS): NUNCA se loguea y solo lo usan
+    # `src/services/users.py` (crear usuarios de Auth) y `src/services/storage.py` (leer y
+    # escribir en el bucket PRIVADO de adjuntos clínicos: con el anon key no se puede).
+    # En producción es OBLIGATORIO definirlo por entorno; el valor por defecto es solo para
+    # desarrollo/pruebas locales.
     SUPABASE_URL: str = "http://127.0.0.1:54321"
     SUPABASE_SERVICE_ROLE_KEY: str = "dev-insecure-service-role-key-change-me"
+    # Base de la API de Storage. Vacía = se deriva de SUPABASE_URL ({SUPABASE_URL}/storage/v1).
+    # Solo hace falta definirla si Storage vive detrás de otro host/gateway.
+    SUPABASE_STORAGE_URL: str | None = None
 
     # --- Token de acceso a la sala del paciente anónimo (hallazgo M3) ---
     # Secreto PROPIO, distinto del de Supabase a propósito (ver src/core/consultation_token.py).
@@ -118,6 +123,30 @@ class Settings(BaseSettings):
     WAITING_ROOM_HEARTBEAT_SECONDS: float = 15.0
     # Vida máxima de un stream; el cliente reconecta. Acota conexiones colgadas.
     WAITING_ROOM_STREAM_MAX_SECONDS: float = 300.0
+
+    # --- Mensajería médico ↔ paciente ---
+    # Ventana tras cerrar el caso en la que el hilo sigue admitiendo mensajes (CA2.2/CA4.5).
+    MESSAGING_AFTER_CLOSE_HOURS: int = 72
+    # Anti-ráfaga de los correos de aviso: no se manda un segundo aviso al mismo destinatario
+    # por el mismo hilo antes de esto si el anterior sigue sin leer (CA6.3).
+    MESSAGING_MAIL_DEBOUNCE_MINUTES: int = 15
+    # Tope de mensajes del paciente por hilo y hora (CA4.4), ADEMÁS del límite por IP
+    # (PUBLIC_WRITE_RATE_LIMIT) de las rutas de escritura.
+    MESSAGING_PATIENT_HOURLY_LIMIT: int = 30
+    # Longitud máxima del cuerpo de un mensaje (CA2.3). El esquema `MessageCreate` la lee de
+    # aquí, así que es el único sitio donde se cambia (y el que ve el OpenAPI).
+    MESSAGING_MAX_BODY_CHARS: int = 2000
+    # Cuánto vale una señal de actividad del paciente para considerarlo "en línea" en el buzón
+    # del médico (CA7.1). El registro es EN MEMORIA DE PROCESO: válido para el despliegue
+    # actual de un solo uvicorn; con varias réplicas cada una vería su propia mitad.
+    MESSAGING_PATIENT_PRESENCE_TTL_SECONDS: int = 45
+    MESSAGING_MAX_ATTACHMENT_SIZE_BYTES: int = 10485760  # 10 MB
+    MESSAGING_ALLOWED_ATTACHMENT_MIME_TYPES: str = (
+        "application/pdf,image/jpeg,image/png,image/webp"
+    )
+    # Bucket PRIVADO de los adjuntos clínicos del chat (ver services/storage.py). Hay que
+    # crearlo en el proyecto de Supabase; en local lo declara `supabase/config.toml`.
+    STORAGE_BUCKET_ATTACHMENTS: str = "chat-attachments"
 
     # --- Videoconsulta (Jitsi) ---
     # Instancia self-hosted (salas abiertas, sin moderador). NO se usa el público meet.jit.si por
@@ -285,6 +314,21 @@ class Settings(BaseSettings):
         obvio.
         """
         return [s for r in self.MAIL_INTERNAL_RECIPIENTS.split(",") if (s := r.strip())]
+
+    @property
+    def supabase_storage_url(self) -> str:
+        """Base de la API de Storage, sin barra final (`.../storage/v1`)."""
+        if self.SUPABASE_STORAGE_URL:
+            return self.SUPABASE_STORAGE_URL.rstrip("/")
+        return f"{self.SUPABASE_URL.rstrip('/')}/storage/v1"
+
+    @property
+    def messaging_allowed_mime_types(self) -> frozenset[str]:
+        return frozenset(
+            m.strip().lower()
+            for m in self.MESSAGING_ALLOWED_ATTACHMENT_MIME_TYPES.split(",")
+            if m.strip()
+        )
 
 
 @lru_cache

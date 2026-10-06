@@ -390,16 +390,42 @@ uv run uvicorn src.main:app --reload      # http://localhost:8000
 | `KIT_API_KEY`          | (vacío = sin métricas de Kit) | **clave API v4 de Kit**, solo lectura de envíos para el embudo de Marketing |
 | `KIT_STATS_CACHE_SECONDS` | `300`         | cuánto se reutilizan las métricas de Kit     |
 | `MARKETING_CAMPAIGNS_SINCE` | `2026-09-01` | primer día (Caracas) de los envíos de Kit que cuentan |
+| `STORAGE_BUCKET_ATTACHMENTS` | `chat-attachments` | **bucket PRIVADO** de los adjuntos del chat (hay que crearlo) |
+| `MESSAGING_AFTER_CLOSE_HOURS` | `72`          | horas tras el cierre en las que el hilo sigue admitiendo mensajes |
+| `MESSAGING_MAX_BODY_CHARS` | `2000`           | tope del cuerpo de un mensaje (sale en el OpenAPI) |
+| `MESSAGING_PATIENT_HOURLY_LIMIT` | `30`       | mensajes del paciente por hilo y hora (además del límite por IP) |
 
 - **Local:** `.env` (copiado de `.env.example`).
 - **Producción:** `.env.supabase` (ignorado por git) o el gestor de secretos del hosting.
   ⚠️ `SUPABASE_JWT_SECRET` es **obligatorio** en producción (Supabase → Settings → API → JWT Secret);
   el valor por defecto del código es solo para desarrollo/pruebas.
 - `SUPABASE_URL` (URL del proyecto; local: `http://127.0.0.1:54321`, el gateway del CLI) y
-  `SUPABASE_SERVICE_ROLE_KEY` (Supabase → Settings → API → `service_role` **secret**) los usa
-  **exclusivamente** `src/services/users.py` para crear usuarios de Auth vía la Admin API
-  (`POST /users`). Igual que `SUPABASE_JWT_SECRET`: **obligatorio** en producción, nunca se
-  loguea, el valor por defecto del código es solo para desarrollo/pruebas.
+  `SUPABASE_SERVICE_ROLE_KEY` (Supabase → Settings → API → `service_role` **secret**) los usan
+  **solo dos módulos**: `src/services/users.py` (crear usuarios de Auth vía la Admin API,
+  `POST /users`) y `src/services/storage.py` (leer y escribir los adjuntos del chat en el
+  bucket privado — ver abajo; el anon key no puede abrir un bucket privado). Igual que
+  `SUPABASE_JWT_SECRET`: **obligatorio** en producción, nunca se loguea, el valor por defecto
+  del código es solo para desarrollo/pruebas.
+
+### Adjuntos del chat: el bucket privado hay que crearlo
+
+Los adjuntos clínicos del buzón médico ↔ paciente (PDFs e imágenes: informes, exámenes, fotos)
+se guardan en el bucket **privado** `chat-attachments` de Supabase Storage, con nombre de objeto
+por UUID (`consultations/{consultation_id}/attachments/{attachment_id}.bin`). El nombre real del
+archivo va cifrado en `message_attachments.file_name`, nunca en la ruta.
+
+- **Nunca se genera una URL pública ni firmada.** El navegador no habla con Storage: la descarga
+  pasa por `GET /api/v1/consultations/{id}/attachments/{attachment_id}`, que valida pertenencia
+  (médico tratante o paciente dueño), registra `READ_CLINICAL_DATA` y sirve el binario con
+  `X-Content-Type-Options: nosniff`. Un admin que no es el tratante recibe 403.
+- **Local:** el bucket lo declara `supabase/config.toml`. Tras un `git pull` que traiga ese
+  cambio hace falta `npx supabase stop && npx supabase start` para que el CLI levante el
+  contenedor de Storage y lo cree. Los tests **no** lo necesitan: `tests/test_messaging.py`
+  inyecta un `httpx.MockTransport` en `src/services/storage.py`.
+- **Producción:** hay que crearlo a mano, una vez: Supabase → Storage → *New bucket*, nombre
+  `chat-attachments`, con **"Public bucket" DESMARCADO**. No hace falta ninguna policy de RLS
+  (la API entra con el service-role key, que las salta). Si falta el bucket, la primera subida
+  responde `502` y el log del arranque ya deja dicho qué bucket y qué URL se esperaban.
 
 ### Correo: `MAIL_INTERNAL_RECIPIENTS` hay que ponerlo al desplegar
 
@@ -557,6 +583,13 @@ protege el endpoint con `require_permission("...")`. Nunca lo insertes a mano.
 | `POST`  | `/consultations/{id}/refer-to-queue`| Derivar con especialista (firmado, sin cita) |
 | `GET`   | `/consultations/{id}/waiting-room`  | Estado de la sala de espera del paciente |
 | `GET`   | `/consultations/{id}/waiting-room/stream` | Lo mismo por SSE             |
+| `GET`   | `/consultations/{id}/messages`       | Hilo de mensajes de la consulta: `{ consultation_id, unread_count, items[], clinical_access }`. Grant fail-closed (sin él, `body` y `file_name` en null); paginado con `limit`/`offset` y recorte por `after_id`/`before_id` |
+| `POST`  | `/consultations/{id}/messages`       | Enviar mensaje: `{ body?, attachment_ids?, client_msg_id? }` (hace falta uno de los dos primeros). Idempotente por `client_msg_id` (200 si ya existía); 409 si la consulta no admite mensajes; rate limit `PUBLIC_WRITE_RATE_LIMIT` |
+| `POST`  | `/consultations/{id}/messages/read`  | Marcar leídos los de la otra dirección → `{ marked: n }`. Idempotente (escritura condicional) |
+| `POST`  | `/consultations/{id}/attachments`    | Subir adjunto clínico `multipart/form-data` (PDF, JPG, PNG, WEBP; **GIF prohibido**, 422). Valida magic bytes y 10 MB; va al bucket privado `chat-attachments` |
+| `GET`   | `/consultations/{id}/attachments/{attachment_id}` | Descargar el adjunto (`inline`, `nosniff`). Exige pertenencia y audita `READ_CLINICAL_DATA`; un admin que no es el tratante recibe 403 |
+| `GET`   | `/inbox`                            | Buzón del médico: un hilo por consulta donde es o fue tratante, con `unread_count`, `last_message_at` y la presencia del paciente. Filtros `only_unread`, `limit`, `offset` |
+| `GET`   | `/inbox/stream`                     | Lo mismo por SSE: evento `inbox` `{ unread_total, updated[] }`, sin cuerpos |
 | `GET`   | `/doctors/specialty-requests`       | Especialidades escritas por médicos (admin) |
 | `POST`  | `/doctors/{id}/specialty-request/resolve` | Asignarle una del catálogo (admin) |
 | `POST`  | `/profiles/{id}/online`             | Presencia del médico (`last_seen_at`) |

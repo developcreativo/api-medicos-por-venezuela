@@ -171,3 +171,66 @@ def test_el_enlace_de_entrada_pasa_por_el_sitio_y_no_por_jitsi() -> None:
     assert consultation_token.is_valid_for(token, consultation_id)
     # Y solo para ESA consulta: un token válido de la propia sala no puede abrir la de otro.
     assert not consultation_token.is_valid_for(token, uuid.uuid4())
+
+
+def test_catalogo_incluye_message_received() -> None:
+    """R6: El catálogo de preferencias de notificación incluye `message_received` en email."""
+    assert "message_received" in notifications.NOTIFICATION_EVENTS
+    assert notifications.NOTIFICATION_EVENTS["message_received"] == ("email",)
+
+
+def test_correo_mensajeria_asercion_negativa_sin_cuerpo_clinico() -> None:
+    """R6 (P7): TEST NEGATIVO — Cero texto clínico ni datos sensibles en el correo.
+
+    El correo es un canal no cifrado en tránsito ni en reposo. Jamás debe llevar:
+    - Cuerpo del mensaje escrito por paciente o médico.
+    - Diagnósticos, síntomas o motivos de consulta.
+    - Nombres de archivos adjuntos.
+    Solo lleva el aviso genérico y el enlace seguro para responder en la plataforma.
+    """
+    cid = uuid.uuid4()
+    cuerpo_clinico_secreto = "Tengo fiebre de 39 y dolor lumbar agudo severo"
+    adjunto_secreto = "radiografia_torax_paciente.pdf"
+
+    # 1. Correo al médico
+    subj_doc, text_doc, html_doc = notifications.doctor_message_received_email(
+        consultation_id=cid, code="CONS-MED-001"
+    )
+    assert subj_doc == "Tu paciente te escribió"
+    assert f"/panel-medico/consulta/{cid}" in text_doc
+    assert f"/panel-medico/consulta/{cid}" in html_doc
+    assert "CONS-MED-001" in text_doc and "CONS-MED-001" in html_doc
+
+    # Aserción negativa estricta
+    for doc_content in (subj_doc, text_doc, html_doc):
+        assert cuerpo_clinico_secreto not in doc_content
+        assert adjunto_secreto not in doc_content
+        assert "fiebre" not in doc_content.lower()
+
+    # 2. Correo al paciente (anónimo con token)
+    subj_pat, text_pat, html_pat = notifications.patient_message_received_email(
+        consultation_id=cid, code="CONS-MED-001", has_account=False
+    )
+    assert subj_pat == "Tu médico te respondió"
+    assert f"/sala-espera?cid={cid}&t=" in text_pat
+    assert f"/sala-espera?cid={cid}&amp;t=" in html_pat
+
+    for pat_content in (subj_pat, text_pat, html_pat):
+        assert cuerpo_clinico_secreto not in pat_content
+        assert adjunto_secreto not in pat_content
+        assert "fiebre" not in pat_content.lower()
+
+    # 3. Correo al paciente con cuenta
+    _, text_pat_acc, html_pat_acc = notifications.patient_message_received_email(
+        consultation_id=cid, code="CONS-MED-001", has_account=True
+    )
+    assert "/mi-caso" in text_pat_acc
+    assert "/mi-caso" in html_pat_acc
+
+
+def test_correo_mensajeria_escapa_codigo_venenoso() -> None:
+    """SEGURIDAD: Si el código de consulta o el enlace contienen marcado vivo, va escapado."""
+    cid = uuid.uuid4()
+    _, text, html = notifications.doctor_message_received_email(consultation_id=cid, code=VENENO)
+    _sin_enlace_vivo(html)
+    assert VENENO in text

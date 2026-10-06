@@ -76,6 +76,7 @@ from src.schemas.consultation_event import (
 )
 from src.services import (
     clinical_access,
+    messaging,
     notifications,
     queue_access,
     registration_mail,
@@ -1032,12 +1033,17 @@ async def waiting_room_stream(
         async with session_factory() as session:
             return await waiting_room.snapshot(session, consultation_id)
 
+    async def fetch_latest_message():
+        async with session_factory() as session:
+            return await messaging.get_latest_patient_message_signal(session, consultation_id)
+
     events = waiting_room.sse_events(
         fetch,
         requested_id=consultation_id,
         poll_seconds=settings.WAITING_ROOM_POLL_SECONDS,
         heartbeat_seconds=settings.WAITING_ROOM_HEARTBEAT_SECONDS,
         max_seconds=settings.WAITING_ROOM_STREAM_MAX_SECONDS,
+        fetch_latest_message=fetch_latest_message,
     )
     return StreamingResponse(
         events,
