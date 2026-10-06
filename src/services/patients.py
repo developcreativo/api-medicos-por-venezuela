@@ -177,7 +177,9 @@ async def create_patient(session: AsyncSession, data: PatientCreate) -> Patient:
         raise BadRequestError("Se requiere el consentimiento del paciente (consent = true).")
     if data.parent_id is not None and await session.get(Patient, data.parent_id) is None:
         raise BadRequestError("El adulto responsable referenciado (parent_id) no existe.")
-    patient = Patient(**data.model_dump())
+    # email_verification_token es solo para verificación previa; no se guarda en la BD.
+    patient_data = data.model_dump(exclude={"email_verification_token"})
+    patient = Patient(**patient_data)
     if patient.parent_id is not None and not patient.cedula:
         patient.cedula = await _resolve_dependent_cedula(session, patient.parent_id)
     if patient.consent and patient.consent_at is None:

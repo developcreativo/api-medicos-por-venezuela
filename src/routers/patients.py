@@ -28,7 +28,7 @@ from src.schemas.patient import (
     PatientResponse,
     PatientUpdate,
 )
-from src.services import clinical_access
+from src.services import clinical_access, email_verification
 from src.services import patients as patients_service
 
 router = APIRouter(prefix="/patients", tags=["patients"])
@@ -118,6 +118,7 @@ async def list_patients(
     summary="Crear paciente (público)",
     responses={
         400: {"description": "Falta el consentimiento (`consent = true`)."},
+        403: {"description": "Verifica tu correo antes de continuar."},
         429: {"description": "Demasiadas altas desde esta IP (rate limit)."},
     },
 )
@@ -129,8 +130,15 @@ async def create_patient(
 
     `request` es obligatorio para slowapi (lee la IP del cliente), aunque no se use aquí.
 
+    Verificación de correo: si `EMAIL_VERIFICATION_REQUIRED` y el payload trae email,
+    exige `email_verification_token` válido para ese correo y propósito "patient".
+    Sin email (alta anónima por API) no se exige nada.
+
     La respuesta lleva `description`/`allergies` en null: quien llama es anónimo y el alta no
     le concede leer datos clínicos (se guardan cifrados). El paciente los ve en `/patients/me`."""
+    email_verification.ensure_verified(
+        token=payload.email_verification_token, email=payload.email, purpose="patient"
+    )
     patient = await patients_service.create_patient(db, payload)
     return PatientResponse.model_validate(patient)
 

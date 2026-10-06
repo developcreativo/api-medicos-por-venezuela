@@ -41,6 +41,28 @@ cd "$(dirname "$0")"
 [ -f "$COMPOSE" ] || { echo "ERROR: no encuentro $COMPOSE (¿estás en el repo?)" >&2; exit 1; }
 [ -f "$ENV_FILE" ] || { echo "ERROR: falta $ENV_FILE en el EC2." >&2; exit 1; }
 
+# --- Pre-check: variables que la app exige para arrancar ---
+# Sin estas, uvicorn levanta y se muere en el lifespan (src/main.py las valida), así que el
+# deploy fallaría recién en el health check del paso 5/5 — después de construir la imagen y de
+# aplicar migraciones a producción. Mejor caerse aquí, antes de tocar nada.
+# `grep -q` sobre el archivo y no `source`: no se cargan los secretos en este shell ni se
+# imprimen nunca (ver .claude/rules/security.md).
+for var in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
+  if ! grep -Eq "^[[:space:]]*${var}=.+" "$ENV_FILE"; then
+    echo "ERROR: falta $var en $ENV_FILE." >&2
+    echo "   Supabase -> Project Settings -> API (la URL del proyecto y el 'service_role' secret)." >&2
+    echo "   Las usan services/users.py (altas de Auth) y services/storage.py (adjuntos del chat)." >&2
+    exit 1
+  fi
+done
+
+# Los adjuntos clínicos del chat van a un bucket PRIVADO de Supabase Storage que NO se crea
+# solo (el CLI solo lo declara para el Supabase local). Si falta, la primera subida de un PDF
+# responde 502. No se puede verificar desde aquí sin pegarle a la API con el secreto, así que
+# queda como recordatorio: una vez por proyecto, y listo.
+echo "ℹ️  Adjuntos del chat: el bucket PRIVADO 'chat-attachments' debe existir en Supabase"
+echo "   (Storage -> New bucket, 'Public bucket' DESMARCADO). Ver README -> 'Adjuntos del chat'."
+
 if [ "$ASSUME_YES" -ne 1 ]; then
   echo "⚠️  Esto aplica migraciones a la Supabase de PRODUCCIÓN."
   read -r -p "¿Tenés un backup reciente? [y/N] " ok

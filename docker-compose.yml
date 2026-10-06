@@ -33,6 +33,14 @@ services:
       # Métricas de Kit en el panel de Marketing. Compose la toma del `.env` de esta carpeta (no
       # versionado); sin ella, el panel muestra solo las respuestas.
       KIT_API_KEY: ${KIT_API_KEY:-}
+      # Verificación de correo (OTP) en dev/e2e: el endpoint de envío devuelve el código en la
+      # respuesta, así los e2e no dependen de Mailtrap. En producción no existe (el arranque aborta).
+      EMAIL_VERIFICATION_DEBUG_CODE: "true"
+      # Mailtrap del `.env` local (no versionado). Sin token, el correo transaccional queda
+      # deshabilitado; con debug activo el flujo local sigue funcionando.
+      MAILTRAP_API_TOKEN: ${MAILTRAP_API_TOKEN:-}
+      MAIL_FROM_EMAIL: ${MAIL_FROM_EMAIL:-no-reply@medicosporvenezuela.org}
+      MAIL_FROM_NAME: ${MAIL_FROM_NAME:-Médicos por Venezuela}
     volumes:
       # Hot-reload en desarrollo.
       - ./src:/code/src:ro

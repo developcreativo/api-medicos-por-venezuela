@@ -42,6 +42,11 @@ class PatientCreate(PatientBase):
     address_encrypted: str | None = Field(
         default=None, pattern=r"^v1:[A-Za-z0-9+/=]+$", max_length=4000
     )
+    # Token de verificación de correo (emitido por POST /email-verification/verify).
+    # Obligatorio cuando EMAIL_VERIFICATION_REQUIRED=true y el payload trae email.
+    # En pacientes, el email es opcional (alta anónima por API sin correo): si no hay
+    # email, no se exige el token.
+    email_verification_token: str | None = None
 
     @model_validator(mode="after")
     def _validaciones_alta_publica(self) -> "PatientCreate":

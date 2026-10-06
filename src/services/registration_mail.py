@@ -422,3 +422,50 @@ async def _send_internal(subject: str, text: str, html: str, *, category: str) -
         category=category,
         bcc=recipients[1:] or None,
     )
+
+
+# --- Verificación de correo (código OTP de 6 dígitos) ---------------------------
+#
+# El endpoint POST /email-verification/send llama a `build_email_verification_mail`
+# para obtener el asunto/texto/html y luego a `send_email_verification_email`
+# para enviarlo. `debug_code` se maneja en el router (solo dev/e2e).
+
+
+def build_email_verification_mail(code: str, ttl_minutes: int) -> tuple[str, str, str]:
+    """Construye el correo con el código de verificación de 6 dígitos.
+
+    Subject: "Tu código de verificación es {code}"
+    HTML: código GRANDE (≈34px, font-weight:800, letter-spacing:6px),
+          "Válido por {ttl} minutos",
+          nota de revisar spam y de que el paso es necesario para verificar el correo.
+    """
+    subject = f"Tu código de verificación es {code}"
+    text = (
+        f"Tu código de verificación es: {code}\n\n"
+        f"Válido por {ttl_minutes} minutos.\n\n"
+        "Este código es necesario para verificar tu correo y completar el registro.\n"
+        "Si no lo pediste, ignora este correo.\n\n"
+        "Nota: revisa tu carpeta de spam si no lo ves en la bandeja de entrada."
+    )
+    html = (
+        f"<p>Tu código de verificación es:</p>"
+        f'<p style="font-size:34px;font-weight:800;letter-spacing:6px;'
+        f"font-family:'Nunito Sans',-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;"
+        f'color:#18202b;text-align:center;">{code}</p>'
+        f"<p>Válido por {ttl_minutes} minutos.</p>"
+        "<p>Este código es necesario para verificar tu correo y completar el registro.</p>"
+        "<p>Si no lo pediste, ignora este correo.</p>"
+        "<p><small>Nota: revisa tu carpeta de spam si no lo ves en la "
+        "bandeja de entrada.</small></p>"
+    )
+    return subject, text, html
+
+
+@best_effort
+async def send_email_verification_email(to_email: str, code: str, ttl_minutes: int) -> bool:
+    """Envía el correo de verificación al usuario. Best-effort.
+
+    Usa la categoría "email-verification" para Mailtrap.
+    """
+    subject, text, html = build_email_verification_mail(code, ttl_minutes)
+    return await send_mail(to_email, subject, text, html, category="email-verification")

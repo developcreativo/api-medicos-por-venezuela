@@ -1129,9 +1129,10 @@ async def test_el_code_no_se_trunca_al_pasar_los_10000(db_session: AsyncSession)
             )
         )
     ) or 0
+    target_seq = max(10000, max_seq + 1)
     # setval no es transaccional: la secuencia queda adelantada, lo cual es inocuo.
     await db_session.execute(
-        text("select setval('consultation_seq', :n, false)"), {"n": max_seq + 1}
+        text("select setval('consultation_seq', :n, false)"), {"n": target_seq}
     )
 
     first = Consultation(patient_id=patient.id, status="waiting")
@@ -1143,8 +1144,8 @@ async def test_el_code_no_se_trunca_al_pasar_los_10000(db_session: AsyncSession)
     await db_session.refresh(second)
 
     assert first.code != second.code
-    assert first.code.split("-")[-1] == str(max_seq + 1)
-    assert second.code.split("-")[-1] == str(max_seq + 2)
+    assert first.code.split("-")[-1] == str(target_seq)
+    assert second.code.split("-")[-1] == str(target_seq + 1)
 
 
 # --- Cifrado y acceso clínico por necesidad de saber (tasks/cifrado-datos-clinicos) ---------

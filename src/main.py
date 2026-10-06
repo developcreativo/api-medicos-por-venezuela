@@ -35,6 +35,7 @@ _IS_PROD = settings.ENVIRONMENT == "production"
 _INSECURE_JWT_DEFAULT = "dev-insecure-jwt-secret-change-me"
 _INSECURE_SERVICE_ROLE_DEFAULT = "dev-insecure-service-role-key-change-me"
 _INSECURE_CONSULTATION_TOKEN_DEFAULT = "dev-insecure-consultation-token-secret-change-me"
+_INSECURE_EMAIL_VERIFICATION_DEFAULT = "dev-insecure-email-verification-secret-change-me"
 _INSECURE_CLINICAL_KEY_DEFAULT = "ZGV2LWluc2VjdXJlLWNsaW5pY2FsLWtleS0zMmJ5dGU="
 _INSECURE_CLINICAL_KID = clinical_crypto.key_id(base64.b64decode(_INSECURE_CLINICAL_KEY_DEFAULT))
 
@@ -51,6 +52,17 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         raise RuntimeError(
             "SUPABASE_SERVICE_ROLE_KEY tiene el valor por defecto inseguro. "
             "Configúralo en producción (Supabase → Settings → API → service_role key)."
+        )
+    if _IS_PROD and settings.EMAIL_VERIFICATION_DEBUG_CODE:
+        raise RuntimeError(
+            "EMAIL_VERIFICATION_DEBUG_CODE no puede estar activo en producción: "
+            "expondría el código de verificación en la respuesta del endpoint de envío."
+        )
+    if _IS_PROD and settings.EMAIL_VERIFICATION_SECRET == _INSECURE_EMAIL_VERIFICATION_DEFAULT:
+        raise RuntimeError(
+            "EMAIL_VERIFICATION_SECRET tiene el valor por defecto inseguro. Configúralo en "
+            "producción (32 bytes aleatorios, propio, no reutilices CONSULTATION_TOKEN_SECRET): "
+            "con él se firman los tokens de verificación de correo."
         )
     # Deja los orígenes CORS efectivos en los logs de arranque: cuando un front rebota por CORS,
     # se ve de una si su origen está (o no) en la lista, sin adivinar desde el .env.
@@ -84,6 +96,20 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         "Mail (Mailtrap): %s",
         "habilitado" if settings.MAILTRAP_API_TOKEN else "deshabilitado (sin MAILTRAP_API_TOKEN)",
     )
+    # Adjuntos clínicos del chat: viven en un bucket PRIVADO de Supabase Storage y se leen con
+    # el service-role key (ver services/storage.py). Si el bucket no está creado, la subida
+    # falla con 502 en la primera petición real; dejarlo en el arranque evita diagnosticarlo
+    # desde el 502. La URL del proyecto no es secreta; la clave no se loguea nunca.
+    logger.info(
+        "Adjuntos del chat: bucket privado '%s' en %s",
+        settings.STORAGE_BUCKET_ATTACHMENTS,
+        settings.supabase_storage_url,
+    )
+    if settings.SUPABASE_SERVICE_ROLE_KEY == _INSECURE_SERVICE_ROLE_DEFAULT:
+        logger.warning(
+            "SUPABASE_SERVICE_ROLE_KEY es el valor por defecto de desarrollo: los adjuntos "
+            "del chat NO se podrán guardar ni leer (Supabase Storage los rechazará)."
+        )
     yield
 
 
@@ -149,7 +175,11 @@ app.add_middleware(
     # routers/reports.py). Por defecto el navegador NO deja leer esa cabecera en una respuesta
     # cross-origin, así que sin exponerla el frontend descargaría los reportes con un nombre
     # inventado por el cliente en vez del que fija el backend.
-    expose_headers=["Content-Disposition"],
+    # X-Unread-Count: el contador de no leídos del hilo de mensajería. La fuente de verdad es
+    # `unread_count` en el cuerpo (ver schemas/message.py::MessagesThreadResponse); la cabecera
+    # se mantiene por compatibilidad y se expone para que sea legible, en vez de mandarla y
+    # que el navegador la descarte en silencio.
+    expose_headers=["Content-Disposition", "X-Unread-Count"],
 )
 
 register_exception_handlers(app)

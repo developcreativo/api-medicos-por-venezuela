@@ -113,18 +113,25 @@ port = 54324
 # sender_name = "Admin"
 
 [storage]
-# Deshabilitado: este proyecto solo usa Auth + Realtime de Supabase (los datos van por
-# PostgREST/el backend FastAPI). Menos contenedores = arranque más liviano en local.
-enabled = false
+# Habilitado desde la mensajería médico ↔ paciente: los adjuntos clínicos del chat (PDF e
+# imágenes) viven en el bucket PRIVADO `chat-attachments`, no en el disco del contenedor.
+# Tras un `git pull` que traiga este cambio hace falta `npx supabase stop && npx supabase start`
+# para que el CLI levante el contenedor de Storage y cree el bucket.
+# Los tests NO dependen de esto: `tests/test_messaging.py` inyecta un `httpx.MockTransport`
+# en `services/storage.py` (mismo patrón que `services/kit.py`).
+enabled = true
 # The maximum file size allowed (e.g. "5MB", "500KB").
 file_size_limit = "50MiB"
 
-# Uncomment to configure local storage buckets
-# [storage.buckets.images]
-# public = false
-# file_size_limit = "50MiB"
-# allowed_mime_types = ["image/png", "image/jpeg"]
-# objects_path = "./images"
+# Adjuntos clínicos del chat (`STORAGE_BUCKET_ATTACHMENTS`, ver src/services/storage.py).
+# PRIVADO: no se sirve nada por URL pública ni firmada — la descarga pasa por
+# `GET /api/v1/consultations/{id}/attachments/{id}`, que exige grant clínico y audita.
+# ⚠️ En el proyecto de Supabase de PRODUCCIÓN este bucket hay que crearlo a mano (Storage →
+# New bucket, "Public bucket" DESMARCADO): este archivo solo configura el Supabase local.
+[storage.buckets.chat-attachments]
+public = false
+file_size_limit = "10MiB"
+allowed_mime_types = ["application/pdf", "image/jpeg", "image/png", "image/webp"]
 
 # Allow connections via S3 compatible clients
 [storage.s3_protocol]

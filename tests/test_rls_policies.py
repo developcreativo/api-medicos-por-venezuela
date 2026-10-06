@@ -290,10 +290,35 @@ async def test_realtime_conserva_solo_la_metadata_administrativa(
 # función SECURITY DEFINER se ejecuta desde el navegador: el frontend ya no llama a RPCs.
 _RLS_HELPERS = {"owns_patient", "is_admin", "is_staff"}
 
+# EXCEPCIÓN RAZONADA, por nombre y solo esta. No es una válvula de escape: si mañana aparece
+# otra función SECURITY DEFINER ejecutable desde el navegador, este test DEBE seguir fallando —
+# en eso consiste su valor. Añadir un nombre aquí exige la misma justificación escrita que tuvo
+# este, y la justificación vive en la migración, no en el test.
+#
+# `20260930_163512_grant_execute_current_user_role.sql` concede `execute` de
+# `public.current_user_role()` a `anon` **y** a `authenticated`, y tiene razón: PostgreSQL
+# RESETEA el ACL al hacer `create or replace function`, así que `20260914_111456` dejó el EXECUTE
+# solo para el dueño y las policies que la llaman —que corren con los privilegios de quien
+# consulta, no del dueño— quedaron rotas. El razonamiento completo está en esa migración.
+#
+# Por qué exponerla no filtra nada de terceros: no recibe argumentos (no hay a quién apuntarla),
+# filtra por `u.id = auth.uid()` y exige `active` y `verified`, así que devuelve SOLO el rol del
+# propio usuario; con `anon`, `auth.uid()` es nulo y no devuelve nada. El complemento de esto lo
+# prueba `test_helpers_de_rls_no_revelan_nada_ajeno_por_rpc`: el helper que SÍ recibe un
+# `user_id` (`doctor_can_practice`) sigue denegado, así que no se puede preguntar por otro.
+#
+# Va en los DOS roles porque el grant es a los dos, y porque las policies se evalúan igual con
+# sesión (`authenticated`) que sin ella (`anon`: el paciente que entra por token de sala).
+_SECURITY_DEFINER_EXPUESTAS_A_PROPOSITO = {"current_user_role"}
+
 
 async def test_navegador_no_ejecuta_funciones_security_definer(db_session: AsyncSession) -> None:
     """20260923_193000 (Security Advisor): mark_patient_entered_call y compañía se podían llamar
-    por /rest/v1/rpc sin sesión y sin comprobar quién llamaba."""
+    por /rest/v1/rpc sin sesión y sin comprobar quién llamaba.
+
+    Las únicas ejecutables desde el navegador son las que las policies necesitan de verdad:
+    `_RLS_HELPERS` para `authenticated` y `_SECURITY_DEFINER_EXPUESTAS_A_PROPOSITO` (ver el
+    porqué junto a cada constante). Cualquier otra, en cualquiera de los dos roles, falla aquí."""
     rows = (
         await db_session.execute(
             text(
@@ -305,8 +330,11 @@ async def test_navegador_no_ejecuta_funciones_security_definer(db_session: Async
         )
     ).all()
     assert rows, "debería haber funciones SECURITY DEFINER en public"
-    assert [r.proname for r in rows if r.anon] == []
-    assert {r.proname for r in rows if r.auth} == _RLS_HELPERS
+    # Conjuntos, no listas: el orden de `pg_proc` no está garantizado.
+    assert {r.proname for r in rows if r.anon} == _SECURITY_DEFINER_EXPUESTAS_A_PROPOSITO
+    assert {r.proname for r in rows if r.auth} == (
+        _RLS_HELPERS | _SECURITY_DEFINER_EXPUESTAS_A_PROPOSITO
+    )
 
 
 async def test_admin_users_cerrada_al_navegador(db_session: AsyncSession) -> None:

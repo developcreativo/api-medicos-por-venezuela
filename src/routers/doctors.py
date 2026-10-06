@@ -41,7 +41,7 @@ from src.schemas.doctor import (
     SpecialtyRequestResolve,
 )
 from src.services import doctors as doctors_service
-from src.services import registration_mail
+from src.services import email_verification, registration_mail
 
 router = APIRouter(prefix="/doctors", tags=["doctors"])
 tag_metadata = [
@@ -149,6 +149,7 @@ async def list_doctors(
     status_code=status.HTTP_201_CREATED,
     summary="Registrar médico (público; verifica en SACS/FPV)",
     responses={
+        403: {"description": "Verifica tu correo antes de continuar."},
         422: {"description": "Formato de cédula/teléfono inválido."},
         429: {"description": "Demasiados registros desde esta IP (rate limit)."},
     },
@@ -170,9 +171,15 @@ async def register_doctor(
 
     Anti-bot: rate limit por IP + campo honeypot (`website`, debe ir vacío).
 
+    Verificación de correo: si `EMAIL_VERIFICATION_REQUIRED` y el payload trae email,
+    exige `email_verification_token` válido para ese correo y propósito "doctor".
+
     Manda dos correos (best-effort, en background): uno a operación con el expediente y el
     veredicto, y otro al médico — de bienvenida si quedó verificado, o pidiéndole título,
     licencia del SACS y carta de artículo 8 si no."""
+    email_verification.ensure_verified(
+        token=payload.email_verification_token, email=payload.email, purpose="doctor"
+    )
     doctor, reason = await doctors_service.create_doctor(db, payload)
     await _queue_registration_mail(background_tasks, db, doctor, reason)
     return doctor

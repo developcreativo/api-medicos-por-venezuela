@@ -10,15 +10,17 @@ tiene email (`patients.email` es opcional).
 """
 
 import logging
+import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core import consultation_token
 from src.core.config import settings
 from src.core.errors import NotFoundError
 from src.core.tz import VET
+from src.models.clinical import Message
 from src.models.consultation import Consultation
 from src.models.patient import Patient
 from src.models.profile import Profile
@@ -43,6 +45,7 @@ NOTIFICATION_EVENTS: dict[str, tuple[str, ...]] = {
     # destinatario no está en la página cuando ocurre.
     "interconsultation_request_broadcast": ("email",),  # buscan tu especialidad para un caso
     "interconsultation_request_taken": ("email",),  # un especialista tomó tu caso
+    "message_received": ("email",),  # aviso por email cuando llega un mensaje nuevo en un hilo
 }
 
 
@@ -532,3 +535,207 @@ def interconsultation_taken_email(
         f'<a href="{panel}">tu panel</a>.</p>'
     )
     return subject, text, html
+
+
+# --- Mensajería médico ↔ paciente (R6 de spec.md) ---
+#
+# Regla de oro de privacidad: NUNCA se incluye texto clínico ni nombres de adjuntos en los
+# correos (tasks/cifrado-datos-clinicos/spec.md y tasks/mensajeria-medico-paciente/spec.md).
+# El correo solo avisa que hay un nuevo mensaje y da un enlace seguro para entrar a la
+# plataforma a responder.
+#
+# Anti-ráfaga (debounce): no se envía un segundo correo al mismo destinatario por el mismo
+# hilo si el anterior salió hace menos de 15 min y sigue sin leer.
+
+_LAST_MAIL_NOTIFICATIONS: dict[tuple[uuid.UUID, str], datetime] = {}
+
+
+def record_mail_debounce(consultation_id: uuid.UUID, recipient_role: str) -> None:
+    _LAST_MAIL_NOTIFICATIONS[(consultation_id, recipient_role)] = datetime.now(UTC)
+
+
+def clear_mail_debounce(consultation_id: uuid.UUID, recipient_role: str) -> None:
+    _LAST_MAIL_NOTIFICATIONS.pop((consultation_id, recipient_role), None)
+
+
+async def should_debounce_mail(
+    session: AsyncSession, consultation_id: uuid.UUID, direction: str
+) -> bool:
+    """Verifica si debe aplicarse anti-ráfaga (debounce) para este envío."""
+    recipient_role = "doctor" if direction == "patient_to_doctor" else "patient"
+    now = datetime.now(UTC)
+    debounce_limit = timedelta(minutes=settings.MESSAGING_MAIL_DEBOUNCE_MINUTES)
+
+    # 1. Comprobación en memoria
+    last_sent = _LAST_MAIL_NOTIFICATIONS.get((consultation_id, recipient_role))
+    if last_sent:
+        if (now - last_sent) < debounce_limit:
+            # Hay notificación reciente en memoria: revisar si aún hay no leídos
+            unread_count = await session.scalar(
+                select(func.count(Message.id)).where(
+                    Message.consultation_id == consultation_id,
+                    Message.direction == direction,
+                    Message.read_at.is_(None),
+                )
+            )
+            if unread_count and unread_count > 0:
+                return True
+        else:
+            _LAST_MAIL_NOTIFICATIONS.pop((consultation_id, recipient_role), None)
+
+    # 2. Comprobación en base de datos (resiliente tras reinicios)
+    recent_unread = await session.scalar(
+        select(func.count(Message.id)).where(
+            Message.consultation_id == consultation_id,
+            Message.direction == direction,
+            Message.read_at.is_(None),
+            Message.sent_at >= now - debounce_limit,
+        )
+    )
+    if recent_unread and recent_unread >= 2:
+        return True
+
+    return False
+
+
+def doctor_message_received_email(
+    consultation_id: uuid.UUID, code: str | None
+) -> tuple[str, str, str]:
+    """(subject, text, html) para el médico cuando el paciente le escribe.
+
+    SIN NINGÚN TEXTO CLÍNICO.
+    """
+    subject = "Tu paciente te escribió"
+    codigo_text = f"Código de caso: {code}\n\n" if code else ""
+    codigo_html = (
+        f'<p style="color:{mail_layout.MUTED};font-size:14px;">'
+        f"<strong>Código de caso:</strong> {esc(code)}</p>"
+        if code
+        else ""
+    )
+    url = f"{settings.FRONTEND_URL.rstrip('/')}/panel-medico/consulta/{consultation_id}"
+    text = (
+        "Tienes un nuevo mensaje de tu paciente en la plataforma.\n\n"
+        f"{codigo_text}"
+        f"Ingresa a tu panel para ver la consulta y responder:\n{url}\n"
+    )
+    escaped_url = esc(url)
+    btn = mail_layout.button(escaped_url, "Ver consulta y responder")
+    html = (
+        "<p>Tienes un nuevo mensaje de tu paciente en la plataforma.</p>"
+        f"{codigo_html}"
+        f'<p style="margin:26px 0;">{btn}</p>'
+        f'<p style="color:{mail_layout.MUTED};font-size:13px;word-break:break-all;">'
+        f"Si el botón no funciona, copia este enlace: "
+        f'<a href="{escaped_url}" style="color:{mail_layout.BLUE};">{escaped_url}</a></p>'
+    )
+    return subject, text, html
+
+
+def patient_message_received_email(
+    consultation_id: uuid.UUID, code: str | None, has_account: bool = False
+) -> tuple[str, str, str]:
+    """(subject, text, html) para el paciente cuando el médico le responde.
+
+    SIN NINGÚN TEXTO CLÍNICO.
+    """
+    subject = "Tu médico te respondió"
+    codigo_text = f"Código de caso: {code}\n\n" if code else ""
+    codigo_html = (
+        f'<p style="color:{mail_layout.MUTED};font-size:14px;">'
+        f"<strong>Código de caso:</strong> {esc(code)}</p>"
+        if code
+        else ""
+    )
+    if has_account:
+        url = f"{settings.FRONTEND_URL.rstrip('/')}/mi-caso"
+    else:
+        url = build_waiting_room_url(consultation_id)
+
+    text = (
+        "Tu médico te ha enviado un mensaje en la plataforma.\n\n"
+        f"{codigo_text}"
+        f"Ingresa para ver el mensaje y continuar con tu atención:\n{url}\n\n"
+        "Si tu situación empeora o hay señales de alarma, busca atención presencial urgente.\n"
+    )
+    escaped_url = esc(url)
+    btn = mail_layout.button(escaped_url, "Ver respuesta de mi médico")
+    html = (
+        "<p>Tu médico te ha enviado un mensaje en la plataforma.</p>"
+        f"{codigo_html}"
+        f'<p style="margin:26px 0;">{btn}</p>'
+        f'<p style="color:{mail_layout.MUTED};font-size:13px;word-break:break-all;">'
+        f"Si el botón no funciona, copia este enlace: "
+        f'<a href="{escaped_url}" style="color:{mail_layout.BLUE};">{escaped_url}</a></p>'
+        f'<p style="background:#fff7ed;border-left:4px solid #f59e0b;padding:12px 14px;'
+        f'margin:22px 0 0;font-size:14px;">'
+        "Si tu situación empeora o hay señales de alarma, busca atención presencial urgente.</p>"
+    )
+    return subject, text, html
+
+
+async def message_received_mail_args(
+    session: AsyncSession, consultation_id: uuid.UUID, message_id: uuid.UUID, direction: str
+) -> dict | None:
+    """Prepara los argumentos para enviar el correo de aviso de mensaje nuevo.
+
+    Retorna None si no corresponde enviar (sin correo, opt-out, o debounce activo).
+    """
+    if await should_debounce_mail(session, consultation_id, direction):
+        logger.info(
+            "MAIL:debounce_skip consultation_id=%s direction=%s", consultation_id, direction
+        )
+        return None
+
+    consultation = await session.get(Consultation, consultation_id)
+    if consultation is None:
+        return None
+
+    if direction == "patient_to_doctor":
+        if not consultation.assigned_doctor_id:
+            return None
+        doctor = await session.get(Profile, consultation.assigned_doctor_id)
+        if doctor is None or not doctor.email:
+            return None
+        if not should_send(doctor.notification_prefs, "message_received", "email"):
+            return None
+        record_mail_debounce(consultation_id, "doctor")
+        subject, text, html = doctor_message_received_email(consultation.id, consultation.code)
+        return {
+            "to_email": doctor.email,
+            "subject": subject,
+            "text": text,
+            "html": html,
+            "category": "mensaje",
+        }
+
+    if direction == "doctor_to_patient":
+        patient = await session.get(Patient, consultation.patient_id)
+        if patient is None or not patient.email:
+            return None
+        record_mail_debounce(consultation_id, "patient")
+        has_account = patient.user_id is not None
+        subject, text, html = patient_message_received_email(
+            consultation.id, consultation.code, has_account=has_account
+        )
+        return {
+            "to_email": patient.email,
+            "subject": subject,
+            "text": text,
+            "html": html,
+            "category": "mensaje",
+        }
+
+    return None
+
+
+@best_effort
+async def send_message_notification(
+    to_email: str,
+    subject: str,
+    text: str,
+    html: str,
+    category: str = "mensaje",
+) -> bool:
+    """Envía el aviso de mensaje nuevo. Best-effort (nunca propaga excepción)."""
+    return await send_mail(to_email, subject, text, html=html, category=category)

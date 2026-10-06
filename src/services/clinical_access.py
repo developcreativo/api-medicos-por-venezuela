@@ -117,7 +117,7 @@ def panel_queue_grant(
 async def audit_clinical_read(
     db: AsyncSession,
     *,
-    principal: Principal,
+    principal: Principal | None = None,
     ip: str | None,
     resource: str,
     grants: Iterable[tuple[uuid.UUID, ClinicalGrant | None]],
@@ -141,7 +141,7 @@ async def audit_clinical_read(
         await log_action(
             db,
             action=READ_CLINICAL_DATA,
-            actor_user_id=principal.id,
+            actor_user_id=principal.id if principal is not None else None,
             resource=resource,
             resource_id=ids[0] if len(ids) == 1 else None,
             metadata={
